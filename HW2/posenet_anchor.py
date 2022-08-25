@@ -86,6 +86,23 @@ def preprocess(split_name,pt_cnt_perpcd):
         poses_arr.append(poses)
     return np.concatenate(valid_id_arr,axis=0),np.concatenate(rgbpcds_arr,axis=0),np.concatenate(poses_arr,axis=0)
 
+def unpack_DATA(dir,elem_dir):
+    metadata = np.load(dir)
+    valid_id = metadata['valid_id'].reshape(-1,1)
+    rgbpcd = metadata['rgbpcd']
+    pose = metadata['pose']
+    for i in tqdm(range(len(valid_id)),desc=f'Unpacking {dir} : '):
+        np.savez(os.path.join(elem_dir,f'{i}.npz'),valid_id=valid_id[i],rgbpcd=rgbpcd[i],pose=pose[i])
+
+
+def handle_process(dir,processed_dir,name):
+    if not os.path.exists(processed_dir):
+        valid_id_arr,rgbpcds_arr,poses_arr = preprocess(name,1024)
+        np.savez(processed_dir,valid_id=valid_id_arr,   rgbpcd=rgbpcds_arr,pose=poses_arr)
+    if len(os.listdir(dir)) == 0:
+        unpack_DATA(processed_dir,dir)
+    print(f'{name} data have been preprocessed...')
+
 # dataset
 class PoseDataset(Dataset):
     def __init__(self,datadir,thumbnail=False) -> None:
@@ -150,13 +167,13 @@ class PoseNet(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
         )
-        self.fc_stack3 = nn.Sequential(
-            nn.Linear(256,128),
-            nn.BatchNorm1d(128),
+        self.fc_stack3_n = nn.Sequential(
+            nn.Linear(256,192),
+            nn.BatchNorm1d(192),
             nn.ReLU(),
         )
             
-        self.fc_out = nn.Linear(128,9)
+        self.fc_out_n = nn.Linear(192,171) #3+24+24*6
 
         self.shapenum = shapenum
 
@@ -187,15 +204,20 @@ class PoseNet(nn.Module):
 
         x = self.fc_stack1(x)
         x = self.fc_stack2(x)
-        x = self.fc_stack3(x)
-        x = self.fc_out(x)
+        x = self.fc_stack3_n(x)
+        x = self.fc_out_n(x)
 
-        R = toRot(x[...,:3],x[...,3:6])
-        M = F.pad(R,(0,1,0,1))
-        M[:,3,3] = 1
-        M[:,:3,3] = x[...,6:] + center.squeeze()
+        # R = toRot(x[...,:3],x[...,3:6])
+        # M = F.pad(R,(0,1,0,1))
+        # M[:,3,3] = 1
+        # M[:,:3,3] = x[...,6:] + center.squeeze()
 
-        return M
+        t = x[:,:3] + center.squeeze()
+        sigma = x[:,3:3+24]
+        dR_ravel = x[:,3+24:].reshape(-1,24,2,3)
+        dR = toRot(dR_ravel[:,:,0],dR_ravel[:,:,1])
+
+        return t,sigma,dR
 
 
 # loss
@@ -214,7 +236,7 @@ def rotation(w,theta):
     return ret
 
 
-def angleloss(R,R_pred,no_grad=False):
+def angleloss(R,R_pred,no_grad=True):
     if no_grad:
         return torch.abs(torch.acos(torch.clamp(0.5*(torch.trace(torch.mm(R,R_pred.transpose(0,1)))-1),-1,1)) *180 / np.pi)
     else:
@@ -232,9 +254,9 @@ rot = {
     'yinf' : [rotation([0,1,0],da) for da in range(0,360,3)],
 }
 
-def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
-    R_pred,R = M_pred[:,:3,:3],M[:,:3,:3]
-    t_pred,t = M_pred[:,:3,3],M[:,:3,3]
+def ShapeAgnosticLoss(R_pred,t_pred,M,valid_id):
+    R = M[:,:3,:3]
+    t = M[:,:3,3]
     t_error = torch.norm(t-t_pred,dim=-1,keepdim=True) # approximation
 
     symms = [id2symm[int(id)] for id in valid_id]
@@ -243,7 +265,7 @@ def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
 
     for i,symm in enumerate(symms):
         if symm == 'no':
-            R_error[i] = angleloss(R[i],R_pred[i],ret_exact_error)
+            R_error[i] = angleloss(R[i],R_pred[i])
             continue
         
         symm_keys = symm.split('|')
@@ -258,12 +280,12 @@ def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
                 for factor_list in product(*factors):
                     results.append(reduce(torch.mm, factor_list))
 
-        R_error[i] = torch.min(torch.stack([angleloss(R[i],torch.mm(R_pred[i],R_symm),ret_exact_error) for R_symm in results]))
+        R_error[i] = torch.min(torch.stack([angleloss(R[i],torch.mm(R_pred[i],R_symm)) for R_symm in results]))
 
-    if ret_exact_error:
-        return t_error,R_error
-    else:
-        return torch.mean(t_error+C*R_error)
+    return t_error,R_error
+
+def rigidmotion(x,R,t):
+    return torch.matmul(R,x.transpose(1,2)) + t.unsqueeze(-1)
 
 def ADDloss(M_pred,M,x):
     x = x[:,:,3:]
@@ -276,21 +298,37 @@ def ADDloss(M_pred,M,x):
 def l2loss(M_pred,M):
     Rerr = torch.norm(M_pred[:,:3,:3]-M[:,:3,:3],dim=(-1,-2)).mean()
     terr = torch.norm(M_pred[:,:3,3]-M[:,:3,3],dim=-1).mean()
-    return 20*terr + Rerr
+    return 30*terr + Rerr
 
 def l1loss(M_pred,M):
-    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 20*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
+    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 30*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
 
-def rigidmotion(x,R,t):
-    return torch.matmul(R,x.transpose(1,2)) + t.unsqueeze(-1)
 
-def unpack_DATA(dir,elem_dir):
-    metadata = np.load(dir)
-    valid_id = metadata['valid_id'].reshape(-1,1)
-    rgbpcd = metadata['rgbpcd']
-    pose = metadata['pose']
-    for i in tqdm(range(len(valid_id)),desc=f'Unpacking {dir} : '):
-        np.savez(os.path.join(elem_dir,f'{i}.npz'),valid_id=valid_id[i],rgbpcd=rgbpcd[i],pose=pose[i])
+axis = np.array([[1,0,0],[0,1,0],[0,0,1],
+                 [1,1,1],[-1,1,1],[1,-1,1],[-1,-1,1],
+                 [-1,0,1],[0,-1,1],[1,0,1],[0,1,1],[1,1,0],[1,-1,0]])
+theta = [[0,90,180,270],[90,180,270],[90,180,270],
+         [120,240],[120,240],[120,240],[120,240],
+         [180],[180],[180],[180],[180],[180]]
+anchor = []
+for i,a in enumerate(axis):
+    for t in theta[i]:
+        anchor.append(rotation(a,t))
+anchor = torch.stack(anchor)
+
+def anchorLoss(sigma,dR_preds,R):
+    # R_preds.shape is [batchsize,24,3,3]
+    # R.shape is [batchsize,3,3]
+    L = ((torch.matmul(dR_preds,anchor.unsqueeze(0))-R.unsqueeze(1))**2).sum((-1,-2))
+    # L.shape is [batchsize,24] (same as sigma)
+
+    # sigma = (sigma - sigma.min(-1)[0].unsqueeze(-1) + 1e-7) / (sigma.max(-1)[0] - sigma.min(-1)[0] + 1e-7).unsqueeze(-1)
+    # return (torch.log(sigma)+L/sigma).sum() / len(sigma)
+    # may get a very big loss...
+
+    return F.mse_loss(sigma,L) + 5*L.mean()
+    
+
 
 def train(model,trainloader_bar,optimizer):
     model.train()
@@ -301,20 +339,18 @@ def train(model,trainloader_bar,optimizer):
         valid_id = valid_id.to('cuda')
         x = x.to('cuda')
         y = y.to('cuda')
-        y_pred = model(x.detach().clone(),valid_id)
+        t_pred,sigma,dR_pred = model(x,valid_id)
         # x will be changed inplace so detach-copy
 
-        #loss = ShapeAgnosticLoss(y_pred,y,valid_id,x)
-        loss = l1loss(y_pred,y) + l2loss(y_pred,y) + 10*ADDloss(y_pred,y,x)
+        loss = 80*(F.l1_loss(t_pred,y[:,:3,3])+F.mse_loss(t_pred,y[:,:3,3])) + anchorLoss(sigma,dR_pred,y[:,:3,:3])
 
         optimizer.zero_grad()
         loss.backward()
-        #nn.utils.clip_grad_norm_(model.parameters(), gradclip)
         optimizer.step()
 
-        torch.cuda.empty_cache()
-
         loss_sum += loss.item()
+
+        torch.cuda.empty_cache()
 
         trainloader_bar.set_postfix(loss=loss.item())
 
@@ -341,9 +377,13 @@ def test(model,loader):
             valid_id = valid_id.to('cuda')
             x = x.to('cuda')
             y = y.to('cuda')
-            y_pred = model(x,valid_id)
+            t_pred,sigma,dR_pred = model(x,valid_id)
+            selected_idx = sigma.argmin(-1)
+            selected_dR = dR_pred[torch.arange(len(dR_pred)), selected_idx]
+            selected_anchor = anchor[selected_idx]
+            R_pred = torch.matmul(selected_dR,selected_anchor)
 
-            t_error,R_error = ShapeAgnosticLoss(y_pred,y,valid_id,ret_exact_error=True)
+            t_error,R_error = ShapeAgnosticLoss(R_pred,t_pred,y,valid_id)
 
             t_correct_count += (t_error<0.01).sum()
             R_correct_count += (R_error<5).sum()
@@ -353,13 +393,6 @@ def test(model,loader):
     return t_correct_count.item() / total_count, R_correct_count.item() / total_count, correct_count.item() / total_count
 
 
-def handle_process(dir,processed_dir,name):
-    if not os.path.exists(processed_dir):
-        valid_id_arr,rgbpcds_arr,poses_arr = preprocess(name,1024)
-        np.savez(processed_dir,valid_id=valid_id_arr,   rgbpcd=rgbpcds_arr,pose=poses_arr)
-    if len(os.listdir(dir)) == 0:
-        unpack_DATA(processed_dir,dir)
-    print(f'{name} data have been preprocessed...')
 
 def reportAcc(name,Tacc,Racc,ALLacc):
     print(f"Accs on {name} set: Tacc = {Tacc:.4f},\
@@ -385,7 +418,7 @@ def mainprocess(debug:bool):
 
     batchsize = 48
     epochs = 10000
-    lr = 1e-3
+    lr = 1e-4
     num_workers = 4 if not debug else 0
 
     model = PoseNet(79)
@@ -401,7 +434,7 @@ def mainprocess(debug:bool):
         torch.save(model.state_dict(), model_dir)
 
     optimizer = Adam(model.parameters(),lr=lr)
-    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # loaders
     trainset = PoseDataset(train_dir,debug)
@@ -431,15 +464,16 @@ def mainprocess(debug:bool):
         torch.save(model.state_dict(), model_dir)
         torch.cuda.empty_cache()
 
-        T_train_for_test,R_train_for_test,all_train_for_test = test(model,trainloader_for_test)
-        T_val,R_val,all_val = test(model,validloader) if not debug else (-1,-1,-1)
         print(f"----loss = {loss:.4f}----")
+
+        T_train_for_test,R_train_for_test,all_train_for_test = test(model,trainloader_for_test)
         reportAcc("train sub",T_train_for_test,R_train_for_test,all_train_for_test)
+        T_val,R_val,all_val = test(model,validloader) if not debug else (-1,-1,-1)
         if not debug: reportAcc("val",T_val,R_val,all_val)
 
         scheduler.step()
-        print(f"lr = {scheduler.get_last_lr()[0]}")
-        if scheduler.get_last_lr()[0] < 1e-6:
+        print(f'lr = {scheduler.get_last_lr()[0]}')
+        if scheduler.get_last_lr()[0] < 1e-16:
             print("[Info] lr too small, stop iteration...")
             break
 
@@ -465,4 +499,5 @@ if __name__ == '__main__':
     #_,pcd,_ = trainset[88]
     #showpcd(np.array(pcd[:,3:]),np.array(pcd[:,:3],dtype=np.float64))
 
-# 结果：训练集60%，验证集56%
+# Accs on train sub set: Tacc = 0.6743,            Racc = 0.8245,            ALLacc = 0.5671
+# Accs on val set: Tacc = 0.7004,            Racc = 0.8078,            ALLacc = 0.5750

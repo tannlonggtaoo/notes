@@ -92,7 +92,7 @@ class PoseDataset(Dataset):
         super().__init__()
         self.filepath = [os.path.join(datadir,filename) for filename in os.listdir(datadir)]
         if thumbnail:
-            self.filepath = self.filepath[:512]
+            self.filepath = self.filepath[:128]
         
     def __len__(self) -> int:
         return len(self.filepath)
@@ -120,43 +120,40 @@ class PoseNet(nn.Module):
             nn.ReLU(),
         )
         self.rgbpcd_emb2 = nn.Sequential(
-            nn.Conv1d(64,64,1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.rgbpcd_emb3 = nn.Sequential(
-            nn.Conv1d(64,64,1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.rgbpcd_emb4 = nn.Sequential(
             nn.Conv1d(64,128,1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
         )
-        self.rgbpcd_emb5 = nn.Sequential(
-            nn.Conv1d(128,1024,1),
+        self.rgbpcd_emb3 = nn.Sequential(
+            nn.Conv1d(128,512,1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+        )
+        self.rgbpcd_emb4 = nn.Sequential(
+            nn.Conv1d(512,1024,1),
             nn.BatchNorm1d(1024),
             nn.ReLU(),
         )
 
+        self.shape_emb = nn.Sequential(
+            nn.Linear(shapenum,64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64,16),
+        )
+
         self.fc_stack1 = nn.Sequential(
-            nn.Linear(shapenum + 64+64+64 + 128 + 1024, 512),
+            nn.Linear(16+1024,512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
         )
         self.fc_stack2 = nn.Sequential(
-            nn.Linear(512,256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-        )
-        self.fc_stack3 = nn.Sequential(
-            nn.Linear(256,128),
+            nn.Linear(512,128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
         )
             
-        self.fc_out = nn.Linear(128,9)
+        self.fc_out1 = nn.Linear(128,9)
 
         self.shapenum = shapenum
 
@@ -164,31 +161,30 @@ class PoseNet(nn.Module):
         # x.shape is [batchsize,pt_count,6]
         # id.shape is [batchsize,1]
         # torch version is too low, so moveaxis is not available
-        center = (x[...,3:].max(-2,keepdim=True)[0] + x[...,3:].min(-2,keepdim=True)[0])/2
+
+        max_b = x[...,3:].max(-2,keepdim=True)[0]
+        min_b = x[...,3:].min(-2,keepdim=True)[0]
+        center = (max_b + min_b)/2
         x[...,3:] = (x[...,3:] - center)
 
         x = x.transpose(1,2)
 
-        x1 = self.rgbpcd_emb1(x)
-        x2 = self.rgbpcd_emb2(x1)
-        x1 = torch.max(x1,2)[0]
-        x3 = self.rgbpcd_emb3(x2)
-        x2 = torch.max(x2,2)[0]
-        x4 = self.rgbpcd_emb4(x3)
-        x3 = torch.max(x3,2)[0]
-        x5 = torch.max(self.rgbpcd_emb5(x4),2)[0]
-        x4 = torch.max(x4,2)[0]
+        x = self.rgbpcd_emb1(x)
 
-        x6 = torch.cat((x1,x2,x3,x4,x5),-1)
+        x = self.rgbpcd_emb2(x)
 
-        shape = F.one_hot(id.long().squeeze(),self.shapenum).float()
+        x = self.rgbpcd_emb3(x)
 
-        x = torch.cat((shape,x6),-1)
+        x = self.rgbpcd_emb4(x)
+
+        x = torch.max(x,2)[0]
+
+        shape = self.shape_emb(F.one_hot(id.long().squeeze(),self.shapenum).float())
+        x = torch.cat((x,shape),-1)
 
         x = self.fc_stack1(x)
         x = self.fc_stack2(x)
-        x = self.fc_stack3(x)
-        x = self.fc_out(x)
+        x = self.fc_out1(x)
 
         R = toRot(x[...,:3],x[...,3:6])
         M = F.pad(R,(0,1,0,1))
@@ -232,7 +228,7 @@ rot = {
     'yinf' : [rotation([0,1,0],da) for da in range(0,360,3)],
 }
 
-def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
+def ShapeAgnosticLoss(M_pred,M,valid_id,x,C=0.05,C_ADD=1,ret_exact_error=False):
     R_pred,R = M_pred[:,:3,:3],M[:,:3,:3]
     t_pred,t = M_pred[:,:3,3],M[:,:3,3]
     t_error = torch.norm(t-t_pred,dim=-1,keepdim=True) # approximation
@@ -263,23 +259,27 @@ def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
     if ret_exact_error:
         return t_error,R_error
     else:
-        return torch.mean(t_error+C*R_error)
+        x = x[:,:,3:]
+        x_gt = rigidmotion(x,R,t)
+        x_pred = rigidmotion(x,R_pred,t_pred)
+        ADD = ((x_gt-x_pred)**2).mean((1,2)).unsqueeze(-1)
+
+        return torch.mean(t_error+C*R_error+C_ADD*ADD)
 
 def ADDloss(M_pred,M,x):
     x = x[:,:,3:]
     R_pred,R = M_pred[:,:3,:3],M[:,:3,:3]
     t_pred,t = M_pred[:,:3,3],M[:,:3,3]
-    x_pred = rigidmotion(x,torch.bmm(R_pred,R.transpose(2,1)),t_pred-torch.bmm(R_pred,t.unsqueeze(-1)).squeeze()).transpose(1,2)
-    ADD = ((x_pred-x)**2).mean()
+    x_gt = rigidmotion(x,R,t)
+    x_pred = rigidmotion(x,R_pred,t_pred)
+    ADD = ((x_gt-x_pred)**2).mean()
     return ADD
 
-def l2loss(M_pred,M):
-    Rerr = torch.norm(M_pred[:,:3,:3]-M[:,:3,:3],dim=(-1,-2)).mean()
-    terr = torch.norm(M_pred[:,:3,3]-M[:,:3,3],dim=-1).mean()
-    return 20*terr + Rerr
 
 def l1loss(M_pred,M):
-    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 20*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
+    Rerr = torch.norm(M_pred[:,:3,:3]-M[:,:3,:3],dim=(-1,-2)).mean()
+    terr = torch.norm(M_pred[:,:3,3]-M[:,:3,3],dim=-1).mean()
+    return 100*terr + Rerr
 
 def rigidmotion(x,R,t):
     return torch.matmul(R,x.transpose(1,2)) + t.unsqueeze(-1)
@@ -292,11 +292,12 @@ def unpack_DATA(dir,elem_dir):
     for i in tqdm(range(len(valid_id)),desc=f'Unpacking {dir} : '):
         np.savez(os.path.join(elem_dir,f'{i}.npz'),valid_id=valid_id[i],rgbpcd=rgbpcd[i],pose=pose[i])
 
-def train(model,trainloader_bar,optimizer):
+def train(model,trainloader,optimizer,scheduler):
     model.train()
     model = model.to('cuda')
     loss_sum = 0
-    for t, (valid_id,x,y) in trainloader_bar:
+    last_loss = np.inf
+    for t, (valid_id,x,y) in trainloader:
 
         valid_id = valid_id.to('cuda')
         x = x.to('cuda')
@@ -305,25 +306,26 @@ def train(model,trainloader_bar,optimizer):
         # x will be changed inplace so detach-copy
 
         #loss = ShapeAgnosticLoss(y_pred,y,valid_id,x)
-        loss = l1loss(y_pred,y) + l2loss(y_pred,y) + 10*ADDloss(y_pred,y,x)
+        loss = ADDloss(y_pred,y,x)
 
         optimizer.zero_grad()
         loss.backward()
         #nn.utils.clip_grad_norm_(model.parameters(), gradclip)
         optimizer.step()
 
-        torch.cuda.empty_cache()
-
         loss_sum += loss.item()
 
-        trainloader_bar.set_postfix(loss=loss.item())
+        if last_loss < loss.item():
+            scheduler.step()
 
-    return loss_sum/len(trainloader_bar)
+        last_loss = loss.item()
+        torch.cuda.empty_cache()
+
+    return loss_sum/len(trainloader)
  
 # torch.autograd.set_detect_anomaly(True)
 # the best way to check where nan value is derived..
 # reason: acos have inf grad at 1 & -1
-
 
 def test(model,loader):
     model = model.to('cuda')
@@ -343,7 +345,7 @@ def test(model,loader):
             y = y.to('cuda')
             y_pred = model(x,valid_id)
 
-            t_error,R_error = ShapeAgnosticLoss(y_pred,y,valid_id,ret_exact_error=True)
+            t_error,R_error = ShapeAgnosticLoss(y_pred,y,valid_id,x, ret_exact_error=True)
 
             t_correct_count += (t_error<0.01).sum()
             R_correct_count += (R_error<5).sum()
@@ -383,7 +385,7 @@ def mainprocess(debug:bool):
         print('training...')
 
 
-    batchsize = 48
+    batchsize = 64
     epochs = 10000
     lr = 1e-3
     num_workers = 4 if not debug else 0
@@ -401,7 +403,7 @@ def mainprocess(debug:bool):
         torch.save(model.state_dict(), model_dir)
 
     optimizer = Adam(model.parameters(),lr=lr)
-    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # loaders
     trainset = PoseDataset(train_dir,debug)
@@ -427,7 +429,7 @@ def mainprocess(debug:bool):
 
     for e in range(epochs):
         bar = tqdm(enumerate(trainloader),total=len(trainloader),desc=f'Epoch {e+1}/{epochs} : ')
-        loss = train(model,bar,optimizer)
+        loss = train(model,bar,optimizer,scheduler)
         torch.save(model.state_dict(), model_dir)
         torch.cuda.empty_cache()
 
@@ -437,9 +439,8 @@ def mainprocess(debug:bool):
         reportAcc("train sub",T_train_for_test,R_train_for_test,all_train_for_test)
         if not debug: reportAcc("val",T_val,R_val,all_val)
 
-        scheduler.step()
-        print(f"lr = {scheduler.get_last_lr()[0]}")
-        if scheduler.get_last_lr()[0] < 1e-6:
+        print(f'lr = {scheduler.get_last_lr()[0]}')
+        if scheduler.get_last_lr()[0] < 1e-16:
             print("[Info] lr too small, stop iteration...")
             break
 
@@ -447,7 +448,9 @@ def mainprocess(debug:bool):
         T_test,R_test,all_test = test(model,testloader)
         reportAcc("test",T_test,R_test,all_test)
 
+# 10 epoch done
 import open3d
+
 def showpcd(pcd,rgb):
     points = open3d.utility.Vector3dVector(pcd)
     colors = open3d.utility.Vector3dVector(rgb)
@@ -458,11 +461,9 @@ def showpcd(pcd,rgb):
 
 
 if __name__ == '__main__':
-    mainprocess(debug=False)
+    mainprocess(debug=True)
 
     #train_dir = '../HW2DATA/train'
     #trainset = PoseDataset(train_dir,False)
     #_,pcd,_ = trainset[88]
     #showpcd(np.array(pcd[:,3:]),np.array(pcd[:,:3],dtype=np.float64))
-
-# 结果：训练集60%，验证集56%

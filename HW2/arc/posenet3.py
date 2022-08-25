@@ -276,10 +276,10 @@ def ADDloss(M_pred,M,x):
 def l2loss(M_pred,M):
     Rerr = torch.norm(M_pred[:,:3,:3]-M[:,:3,:3],dim=(-1,-2)).mean()
     terr = torch.norm(M_pred[:,:3,3]-M[:,:3,3],dim=-1).mean()
-    return 20*terr + Rerr
+    return 50*terr + Rerr
 
 def l1loss(M_pred,M):
-    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 20*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
+    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 50*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
 
 def rigidmotion(x,R,t):
     return torch.matmul(R,x.transpose(1,2)) + t.unsqueeze(-1)
@@ -292,10 +292,11 @@ def unpack_DATA(dir,elem_dir):
     for i in tqdm(range(len(valid_id)),desc=f'Unpacking {dir} : '):
         np.savez(os.path.join(elem_dir,f'{i}.npz'),valid_id=valid_id[i],rgbpcd=rgbpcd[i],pose=pose[i])
 
-def train(model,trainloader_bar,optimizer):
+def train(model,trainloader_bar,optimizer,scheduler):
     model.train()
     model = model.to('cuda')
     loss_sum = 0
+    last_loss = np.inf
     for t, (valid_id,x,y) in trainloader_bar:
 
         valid_id = valid_id.to('cuda')
@@ -312,11 +313,15 @@ def train(model,trainloader_bar,optimizer):
         #nn.utils.clip_grad_norm_(model.parameters(), gradclip)
         optimizer.step()
 
-        torch.cuda.empty_cache()
-
         loss_sum += loss.item()
 
-        trainloader_bar.set_postfix(loss=loss.item())
+        if last_loss < loss.item():
+            scheduler.step()
+
+        last_loss = loss.item()
+        torch.cuda.empty_cache()
+
+        trainloader_bar.set_postfix(loss=last_loss,lr=scheduler.get_last_lr()[0])
 
     return loss_sum/len(trainloader_bar)
  
@@ -401,7 +406,7 @@ def mainprocess(debug:bool):
         torch.save(model.state_dict(), model_dir)
 
     optimizer = Adam(model.parameters(),lr=lr)
-    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.9995)
 
     # loaders
     trainset = PoseDataset(train_dir,debug)
@@ -427,7 +432,7 @@ def mainprocess(debug:bool):
 
     for e in range(epochs):
         bar = tqdm(enumerate(trainloader),total=len(trainloader),desc=f'Epoch {e+1}/{epochs} : ')
-        loss = train(model,bar,optimizer)
+        loss = train(model,bar,optimizer,scheduler)
         torch.save(model.state_dict(), model_dir)
         torch.cuda.empty_cache()
 
@@ -437,9 +442,7 @@ def mainprocess(debug:bool):
         reportAcc("train sub",T_train_for_test,R_train_for_test,all_train_for_test)
         if not debug: reportAcc("val",T_val,R_val,all_val)
 
-        scheduler.step()
-        print(f"lr = {scheduler.get_last_lr()[0]}")
-        if scheduler.get_last_lr()[0] < 1e-6:
+        if scheduler.get_last_lr()[0] < 1e-16:
             print("[Info] lr too small, stop iteration...")
             break
 
@@ -447,7 +450,6 @@ def mainprocess(debug:bool):
         T_test,R_test,all_test = test(model,testloader)
         reportAcc("test",T_test,R_test,all_test)
 
-import open3d
 def showpcd(pcd,rgb):
     points = open3d.utility.Vector3dVector(pcd)
     colors = open3d.utility.Vector3dVector(rgb)
@@ -464,5 +466,3 @@ if __name__ == '__main__':
     #trainset = PoseDataset(train_dir,False)
     #_,pcd,_ = trainset[88]
     #showpcd(np.array(pcd[:,3:]),np.array(pcd[:,:3],dtype=np.float64))
-
-# 结果：训练集60%，验证集56%

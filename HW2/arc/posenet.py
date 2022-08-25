@@ -92,7 +92,7 @@ class PoseDataset(Dataset):
         super().__init__()
         self.filepath = [os.path.join(datadir,filename) for filename in os.listdir(datadir)]
         if thumbnail:
-            self.filepath = self.filepath[:512]
+            self.filepath = self.filepath[:8]
         
     def __len__(self) -> int:
         return len(self.filepath)
@@ -118,45 +118,63 @@ class PoseNet(nn.Module):
             nn.Conv1d(6,64,1),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-        )
-        self.rgbpcd_emb2 = nn.Sequential(
-            nn.Conv1d(64,64,1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.rgbpcd_emb3 = nn.Sequential(
-            nn.Conv1d(64,64,1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.rgbpcd_emb4 = nn.Sequential(
+
             nn.Conv1d(64,128,1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
         )
-        self.rgbpcd_emb5 = nn.Sequential(
-            nn.Conv1d(128,1024,1),
+
+        self.rgbpcd_emb2 = nn.Sequential(
+            nn.Conv1d(128,256,1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+
+        self.rgbpcd_emb3 = nn.Sequential(
+            nn.Conv1d(128+256,1024,1),
             nn.BatchNorm1d(1024),
             nn.ReLU(),
         )
 
-        self.fc_stack1 = nn.Sequential(
-            nn.Linear(shapenum + 64+64+64 + 128 + 1024, 512),
-            nn.BatchNorm1d(512),
+        self.rgbpcd_emb4 = nn.Sequential(
+            nn.Conv1d(128+256+1024,2048,1),
+            nn.BatchNorm1d(2048),
+            nn.ReLU(),
+        )
+
+        self.shape_emb_n = nn.Sequential(
+            nn.Linear(shapenum,128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128,128),
+        )
+
+        self.fc_stack1_n = nn.Sequential(
+            nn.Linear(128+256+1024 + 2048 + 128,1024),
             nn.ReLU(),
         )
         self.fc_stack2 = nn.Sequential(
-            nn.Linear(512,256),
-            nn.BatchNorm1d(256),
+            nn.Linear(1024,512),
             nn.ReLU(),
         )
         self.fc_stack3 = nn.Sequential(
+            nn.Linear(512,256),
+            nn.ReLU(),
+        )
+        self.fc_stack4 = nn.Sequential(
             nn.Linear(256,128),
-            nn.BatchNorm1d(128),
+            nn.ReLU(),
+        )
+        self.fc_stack5 = nn.Sequential(
+            nn.Linear(128,64),
+            nn.ReLU(),
+        )
+        self.fc_stack6 = nn.Sequential(
+            nn.Linear(64,32),
             nn.ReLU(),
         )
             
-        self.fc_out = nn.Linear(128,9)
+        self.fc_out1_n = nn.Linear(32,9)
 
         self.shapenum = shapenum
 
@@ -164,38 +182,55 @@ class PoseNet(nn.Module):
         # x.shape is [batchsize,pt_count,6]
         # id.shape is [batchsize,1]
         # torch version is too low, so moveaxis is not available
-        center = (x[...,3:].max(-2,keepdim=True)[0] + x[...,3:].min(-2,keepdim=True)[0])/2
-        x[...,3:] = (x[...,3:] - center)
 
+        # x = x[:,np.random.choice(x.shape[1],self.pt_num),:]
         x = x.transpose(1,2)
+        # center = x[:,3:6].mean(dim=-1,keepdim=True)
+        # scale = x[:,3:6].max(dim=-1,keepdim=True)[0]-x[:,3:6].min(dim=-1,keepdim=True)[0] + 1e-4
+        # x[:,3:6] = (x[:,3:6] - center) / scale
+        # x[:,:3] = 2*x[:,:3] - 1 # color
 
-        x1 = self.rgbpcd_emb1(x)
-        x2 = self.rgbpcd_emb2(x1)
-        x1 = torch.max(x1,2)[0]
-        x3 = self.rgbpcd_emb3(x2)
-        x2 = torch.max(x2,2)[0]
-        x4 = self.rgbpcd_emb4(x3)
-        x3 = torch.max(x3,2)[0]
-        x5 = torch.max(self.rgbpcd_emb5(x4),2)[0]
-        x4 = torch.max(x4,2)[0]
+        center = x.mean(dim=-1,keepdim=True)
+        scale = x.max(dim=-1,keepdim=True)[0]-x.min(dim=-1,keepdim=True)[0] + 1e-7
+        x = (x - center) / scale
 
-        x6 = torch.cat((x1,x2,x3,x4,x5),-1)
+        x = self.rgbpcd_emb1(x)
+        res1 = self.rgbpcd_emb2(x)
+        x = torch.cat((x,res1),-2)
 
-        shape = F.one_hot(id.long().squeeze(),self.shapenum).float()
+        res2 = self.rgbpcd_emb3(x)
+        x = torch.cat((x,res2),-2)
+        
+        res3 = self.rgbpcd_emb4(x)
+        x = torch.cat((x,res3),-2)
 
-        x = torch.cat((shape,x6),-1)
+        x = torch.max(x,2)[0]
 
-        x = self.fc_stack1(x)
+        shape = self.shape_emb_n(F.one_hot(id.long().squeeze(),self.shapenum).float())
+        x = torch.cat((x,shape),-1)
+
+        x = self.fc_stack1_n(x)
         x = self.fc_stack2(x)
         x = self.fc_stack3(x)
-        x = self.fc_out(x)
+        x = self.fc_stack4(x)
+        x = self.fc_stack5(x)
+        x = self.fc_stack6(x)
+        x = self.fc_out1_n(x)
 
         R = toRot(x[...,:3],x[...,3:6])
         M = F.pad(R,(0,1,0,1))
+        M[:,:3,3] = scale[:,3:].squeeze()*x[...,6:] + center[:,3:].squeeze()
         M[:,3,3] = 1
-        M[:,:3,3] = x[...,6:] + center.squeeze()
 
+        #return M
         return M
+
+def check_dim():
+    model = PoseNet()
+    x = torch.rand(32,1024,6) # a little different
+    M = model(x)
+    print(M.shape)
+    print(M[0])
 
 
 # loss
@@ -220,7 +255,21 @@ def angleloss(R,R_pred,no_grad=False):
     else:
         return torch.abs(torch.acos(torch.clamp(0.5*(torch.trace(torch.mm(R,R_pred.transpose(0,1)))-1),-1+1e-7,1-1e-7)) *180 / np.pi)
 
-rot = {
+
+rot_train = {
+    'x2' : [rotation([1,0,0],0),rotation([1,0,0],180)],
+    'x4' : [rotation([1,0,0],0),rotation([1,0,0],90),rotation([1,0,0],180),rotation([1,0,0],270)],
+    'y2' : [rotation([0,1,0],0),rotation([0,1,0],180)],
+    'y4' : [rotation([0,1,0],0),rotation([0,1,0],90),rotation([0,1,0],180),rotation([0,1,0],270)],
+    'z2' : [rotation([0,0,1],0),rotation([0,0,1],180)],
+    'z4' : [rotation([0,0,1],0),rotation([0,0,1],90),rotation([0,0,1],180),rotation([0,0,1],270)],
+    'zinf' : [rotation([0,0,1],da) for da in range(0,360,10)],
+    'xinf' : [rotation([1,0,0],da) for da in range(0,360,10)],
+    'yinf' : [rotation([0,1,0],da) for da in range(0,360,10)],
+    }
+# inf is 60 in first 10 epochs
+
+rot_test = {
     'x2' : [rotation([1,0,0],0),rotation([1,0,0],180)],
     'x4' : [rotation([1,0,0],0),rotation([1,0,0],90),rotation([1,0,0],180),rotation([1,0,0],270)],
     'y2' : [rotation([0,1,0],0),rotation([0,1,0],180)],
@@ -232,14 +281,17 @@ rot = {
     'yinf' : [rotation([0,1,0],da) for da in range(0,360,3)],
 }
 
-def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
+def ShapeAgnosticLoss(M_pred,M,valid_id,x,C=0.1,C_ADD=0.1,ret_exact_error=False):
     R_pred,R = M_pred[:,:3,:3],M[:,:3,:3]
     t_pred,t = M_pred[:,:3,3],M[:,:3,3]
-    t_error = torch.norm(t-t_pred,dim=-1,keepdim=True) # approximation
+    t_error = torch.min(torch.norm(2*t-t_pred,dim=-1,keepdim=True),torch.norm(t-t_pred,dim=-1,keepdim=True)) # approximation
 
     symms = [id2symm[int(id)] for id in valid_id]
 
     R_error = torch.zeros_like(valid_id).to('cuda')
+
+    # debugging
+    rot = rot_test if ret_exact_error else rot_train
 
     for i,symm in enumerate(symms):
         if symm == 'no':
@@ -263,23 +315,15 @@ def ShapeAgnosticLoss(M_pred,M,valid_id,C=0.05,ret_exact_error=False):
     if ret_exact_error:
         return t_error,R_error
     else:
-        return torch.mean(t_error+C*R_error)
+        x = x[:,:,3:]
+        x_gt = rigidmotion(x,R,t)
+        x_gt2 = x_gt + t.unsqueeze(-1)
+        x_pred = rigidmotion(x,R_pred,t_pred)
+        ADD = torch.min(((x_gt-x_pred)**2).sum((1,2)),((x_gt2-x_pred)**2).sum((1,2)))
 
-def ADDloss(M_pred,M,x):
-    x = x[:,:,3:]
-    R_pred,R = M_pred[:,:3,:3],M[:,:3,:3]
-    t_pred,t = M_pred[:,:3,3],M[:,:3,3]
-    x_pred = rigidmotion(x,torch.bmm(R_pred,R.transpose(2,1)),t_pred-torch.bmm(R_pred,t.unsqueeze(-1)).squeeze()).transpose(1,2)
-    ADD = ((x_pred-x)**2).mean()
-    return ADD
-
-def l2loss(M_pred,M):
-    Rerr = torch.norm(M_pred[:,:3,:3]-M[:,:3,:3],dim=(-1,-2)).mean()
-    terr = torch.norm(M_pred[:,:3,3]-M[:,:3,3],dim=-1).mean()
-    return 20*terr + Rerr
-
-def l1loss(M_pred,M):
-    return F.l1_loss(M_pred[:,:3,:3], M[:,:3,:3]) + 20*F.l1_loss(M_pred[:,:3,3], M[:,:3,3])
+        t_error = F.relu(t_error - 0.01*0.5)
+        R_error = F.relu(R_error - 5*0.5)
+        return torch.mean(t_error+C*R_error+C_ADD*ADD)
 
 def rigidmotion(x,R,t):
     return torch.matmul(R,x.transpose(1,2)) + t.unsqueeze(-1)
@@ -292,11 +336,11 @@ def unpack_DATA(dir,elem_dir):
     for i in tqdm(range(len(valid_id)),desc=f'Unpacking {dir} : '):
         np.savez(os.path.join(elem_dir,f'{i}.npz'),valid_id=valid_id[i],rgbpcd=rgbpcd[i],pose=pose[i])
 
-def train(model,trainloader_bar,optimizer):
+def train(model,trainloader,optimizer,gradclip):
     model.train()
     model = model.to('cuda')
     loss_sum = 0
-    for t, (valid_id,x,y) in trainloader_bar:
+    for t, (valid_id,x,y) in trainloader:
 
         valid_id = valid_id.to('cuda')
         x = x.to('cuda')
@@ -304,26 +348,21 @@ def train(model,trainloader_bar,optimizer):
         y_pred = model(x.detach().clone(),valid_id)
         # x will be changed inplace so detach-copy
 
-        #loss = ShapeAgnosticLoss(y_pred,y,valid_id,x)
-        loss = l1loss(y_pred,y) + l2loss(y_pred,y) + 10*ADDloss(y_pred,y,x)
+        loss = ShapeAgnosticLoss(y_pred,y,valid_id,x)
 
         optimizer.zero_grad()
         loss.backward()
         #nn.utils.clip_grad_norm_(model.parameters(), gradclip)
         optimizer.step()
 
+        loss_sum += loss.item()
         torch.cuda.empty_cache()
 
-        loss_sum += loss.item()
-
-        trainloader_bar.set_postfix(loss=loss.item())
-
-    return loss_sum/len(trainloader_bar)
+    return loss_sum/len(trainloader)
  
 # torch.autograd.set_detect_anomaly(True)
 # the best way to check where nan value is derived..
 # reason: acos have inf grad at 1 & -1
-
 
 def test(model,loader):
     model = model.to('cuda')
@@ -341,9 +380,9 @@ def test(model,loader):
             valid_id = valid_id.to('cuda')
             x = x.to('cuda')
             y = y.to('cuda')
-            y_pred = model(x,valid_id)
+            y_pred = model(x.detach().clone(),valid_id)
 
-            t_error,R_error = ShapeAgnosticLoss(y_pred,y,valid_id,ret_exact_error=True)
+            t_error,R_error = ShapeAgnosticLoss(y_pred,y,valid_id,x, ret_exact_error=True)
 
             t_correct_count += (t_error<0.01).sum()
             R_correct_count += (R_error<5).sum()
@@ -383,10 +422,12 @@ def mainprocess(debug:bool):
         print('training...')
 
 
-    batchsize = 48
-    epochs = 10000
+    batchsize = 16
+    epochs = 40
     lr = 1e-3
     num_workers = 4 if not debug else 0
+    gradclip = 1
+    start_schedule = 5
 
     model = PoseNet(79)
 
@@ -411,12 +452,11 @@ def mainprocess(debug:bool):
 
     # create a train subset to check fitting
     if debug:
-        trainloader_for_test = trainloader
+        trainset_for_test = trainloader.dataset
     else:
         trainset_for_test,_ = random_split(trainloader.dataset,[int(0.01*len(trainloader.dataset)),len(trainloader.dataset)-int(0.01*len(trainloader.dataset))])
-        trainloader_for_test = DataLoader(trainset_for_test,trainloader.batch_size)
-    print(f'trainset for test size = {len(trainloader_for_test.dataset)}')
-    
+    print(f'trainset for test size = {len(trainset_for_test)}')
+    trainloader_for_test = DataLoader(trainset_for_test,trainloader.batch_size)
 
     validset = PoseDataset(val_dir)
     testset, validset = random_split(validset,[int(0.8*len(validset)),len(validset)-int(0.8*len(validset))])
@@ -427,7 +467,7 @@ def mainprocess(debug:bool):
 
     for e in range(epochs):
         bar = tqdm(enumerate(trainloader),total=len(trainloader),desc=f'Epoch {e+1}/{epochs} : ')
-        loss = train(model,bar,optimizer)
+        loss = train(model,bar,optimizer,gradclip)
         torch.save(model.state_dict(), model_dir)
         torch.cuda.empty_cache()
 
@@ -437,32 +477,13 @@ def mainprocess(debug:bool):
         reportAcc("train sub",T_train_for_test,R_train_for_test,all_train_for_test)
         if not debug: reportAcc("val",T_val,R_val,all_val)
 
-        scheduler.step()
-        print(f"lr = {scheduler.get_last_lr()[0]}")
-        if scheduler.get_last_lr()[0] < 1e-6:
-            print("[Info] lr too small, stop iteration...")
-            break
+        if loss < start_schedule: scheduler.step()
 
     if not debug:
         T_test,R_test,all_test = test(model,testloader)
         reportAcc("test",T_test,R_test,all_test)
 
-import open3d
-def showpcd(pcd,rgb):
-    points = open3d.utility.Vector3dVector(pcd)
-    colors = open3d.utility.Vector3dVector(rgb)
-    _pcd = open3d.geometry.PointCloud()
-    _pcd.points = points
-    _pcd.colors = colors
-    open3d.visualization.draw_geometries([_pcd])
-
+# 10 epoch done
 
 if __name__ == '__main__':
-    mainprocess(debug=False)
-
-    #train_dir = '../HW2DATA/train'
-    #trainset = PoseDataset(train_dir,False)
-    #_,pcd,_ = trainset[88]
-    #showpcd(np.array(pcd[:,3:]),np.array(pcd[:,:3],dtype=np.float64))
-
-# 结果：训练集60%，验证集56%
+    mainprocess(debug=True)
